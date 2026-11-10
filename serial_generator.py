@@ -1,19 +1,21 @@
 """Serial Number Generator - a small, modern Tkinter app.
 
 Serials have the form <PREFIX><NNN>, e.g. ABC001 ... ABC999.
-Each prefix has its own CSV sheet in the serials/ folder, and a serial is
+Each prefix has its own sheet in serials.xlsx, and a serial is
 never generated again.
 """
 
-import csv
 import os
 import re
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, messagebox
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serials")
-CSV_HEADER = ["serial", "prefix", "number", "part_number", "created"]
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
+
+XLSX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serials.xlsx")
+HEADER = ["serial", "prefix", "number", "part_number", "created"]
 DIGITS = 3
 MAX_NUMBER = 10**DIGITS - 1
 
@@ -38,26 +40,39 @@ def clean_part_number(raw: str) -> str:
 
 
 class SerialStore:
-    """One CSV file ("sheet") per prefix in DATA_DIR; guarantees uniqueness."""
+    """All serials live in one Excel workbook with a sheet per prefix."""
 
-    def __init__(self, folder: str = DATA_DIR):
-        self.folder = folder
-        os.makedirs(folder, exist_ok=True)
+    def __init__(self, path: str = XLSX_FILE):
+        self.path = path
         self.used: dict[str, set[int]] = {}
-        for name in os.listdir(folder):
-            if name.lower().endswith(".csv"):
-                prefix = normalize_prefix(name[:-4])
-                with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
-                    self.used[prefix] = {int(r["number"]) for r in csv.DictReader(f)}
+        if os.path.exists(path):
+            self.wb = load_workbook(path)
+            for ws in self.wb.worksheets:
+                self.used[ws.title] = {
+                    int(row[2]) for row in ws.iter_rows(min_row=2, values_only=True)
+                    if row and row[2] is not None
+                }
+        else:
+            self.wb = Workbook()
+            self.wb.remove(self.wb.active)  # start with no empty default sheet
 
     def prefixes(self) -> list[str]:
         return sorted(self.used)
 
-    def path(self, prefix: str) -> str:
-        return os.path.join(self.folder, f"{prefix}.csv")
-
     def remaining(self, prefix: str) -> int:
         return MAX_NUMBER - len(self.used.get(prefix, ()))
+
+    def _sheet(self, prefix: str):
+        if prefix in self.wb.sheetnames:
+            return self.wb[prefix]
+        ws = self.wb.create_sheet(prefix)
+        ws.append(HEADER)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for col, width in zip("ABCDE", (14, 10, 9, 24, 20)):
+            ws.column_dimensions[col].width = width
+        ws.freeze_panes = "A2"
+        return ws
 
     def generate(self, prefix: str, count: int, part_number: str) -> list[str]:
         """Create `count` new serials (lowest unused numbers) and save them."""
@@ -65,23 +80,30 @@ class SerialStore:
         part_number = clean_part_number(part_number)
         if not prefix:
             raise ValueError("Prefix must contain at least one letter or digit.")
+        if len(prefix) > 31:
+            raise ValueError("Prefix can be at most 31 characters (Excel sheet name limit).")
         if not part_number:
             raise ValueError("Please enter a part number.")
-        used = self.used.setdefault(prefix, set())
+        used = self.used.get(prefix, set())
         free = [n for n in range(1, MAX_NUMBER + 1) if n not in used][:count]
         if len(free) < count:
             raise ValueError(f"Only {len(free)} serial(s) left for prefix '{prefix}'.")
-        path = self.path(prefix)
-        new_file = not os.path.exists(path)
-        now = datetime.now().isoformat(timespec="seconds")
+        ws = self._sheet(prefix)
+        now = datetime.now().replace(microsecond=0)
         serials = [f"{prefix}{n:0{DIGITS}d}" for n in free]
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if new_file:
-                w.writerow(CSV_HEADER)
-            for serial, n in zip(serials, free):
-                w.writerow([serial, prefix, f"{n:0{DIGITS}d}", part_number, now])
-        used.update(free)
+        for serial, n in zip(serials, free):
+            ws.append([serial, prefix, f"{n:0{DIGITS}d}", part_number, now])
+            ws.cell(ws.max_row, 5).number_format = "yyyy-mm-dd hh:mm:ss"
+        try:
+            self.wb.save(self.path)
+        except PermissionError:
+            # Roll back in memory so nothing is handed out that wasn't saved.
+            ws.delete_rows(ws.max_row - len(free) + 1, len(free))
+            if ws.max_row == 1 and prefix not in self.used:
+                self.wb.remove(ws)
+            raise ValueError(f"Could not save {os.path.basename(self.path)}. "
+                             "Close it in Excel and try again.")
+        self.used.setdefault(prefix, set()).update(free)
         return serials
 
 
@@ -180,7 +202,7 @@ class App(tk.Tk):
                                   selectbackground=ACCENT, selectforeground="#ffffff")
         self.results.pack(fill="both", expand=True)
 
-        self.status = ttk.Label(root, text="Saved to the serials/ folder (one sheet per prefix)",
+        self.status = ttk.Label(root, text="Saved to serials.xlsx (one sheet per prefix)",
                                 style="Sub.TLabel")
         self.status.pack(anchor="w", pady=(8, 0))
 
@@ -211,7 +233,7 @@ class App(tk.Tk):
         self._on_prefix()
         prefix = normalize_prefix(self.prefix_var.get())
         self.status.config(text=f"Generated {len(serials)} × {clean_part_number(self.part_var.get())}"
-                                f" · saved to serials/{prefix}.csv")
+                                f" · saved to sheet {prefix} in serials.xlsx")
 
     def copy_all(self):
         items = self.results.get(0, "end")
